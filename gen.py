@@ -83,44 +83,71 @@ S = {
 #     return False
 
 # 優化後
-def _save_cookies(ctx: BrowserContext):
-    """透過作業系統的 Keyring 安全地儲存 cookies"""
-    # 從瀏覽器 context 取得目前所有 cookies
-    c = ctx.cookies()
+import os
+from cryptography.fernet import Fernet
+
+# 💡 我們把本地檔案命名為 cookies.enc (加密檔)
+COOKIE_ENC_PATH = "cookies.enc"
+
+def _get_or_create_key():
+    """Retrieve encryption key from keyring, or generate a new one if not exists."""
+    import keyring
     
-    try:
-        # 將 cookies 轉成 JSON 字串（方便儲存）
-        cookie_string = json.dumps(c)
-        # 使用 keyring 存到系統憑證管理中（會加密）
-        keyring.set_password(SERVICE_NAME, ACCOUNT_NAME, cookie_string)
-        # 紀錄成功訊息
-        logger.info(f"Successfully secured {len(c)} cookies in system keyring.")
-        
-    except Exception as e:
-        # 如果儲存失敗，記錄錯誤
-        logger.error(f"Failed to save cookies to keyring: {e}")
+    # 從系統金鑰庫拿取「加密鑰匙」（這把鑰匙很小，絕對不會超過 Windows 上限）
+    key_str = keyring.get_password("chatgpt_web_gen", "encryption_key")
+    if not key_str:
+        # 如果是第一次，生成一把標準的 Fernet 鑰匙並鎖進系統
+        new_key = Fernet.generate_key()
+        keyring.set_password("chatgpt_web_gen", "encryption_key", new_key.decode('utf-8'))
+        return new_key
+    return key_str.encode('utf-8')
 
-
-def _load_cookies(ctx: BrowserContext) -> bool:
-    """從作業系統的 Keyring 還原 cookies"""
-    try:
-        # 從 keyring 取出之前儲存的 cookies（JSON 字串）
-        cookie_string = keyring.get_password(SERVICE_NAME, ACCOUNT_NAME)
-        # 如果沒有資料，直接回傳 False（代表沒有可用 cookies）
-        if not cookie_string:
-            return False
-        # 將 JSON 字串轉回 Python 物件（cookies list）
-        c = json.loads(cookie_string)
-        # 如果有 cookies，就加入到瀏覽器 context 中
-        if c:
-            ctx.add_cookies(c)
-            logger.info(f"Restored {len(c)} cookies from system keyring.")
-        return True
-
-    except Exception as e:
-        # 發生錯誤（例如 keyring 讀取失敗、JSON parse 錯誤）
-        logger.error(f"Failed to load cookies from keyring: {e}")
+def _load_cookies(ctx):
+    """Load encrypted cookies from local file, decrypt using key from keyring, and apply."""
+    if not os.path.exists(COOKIE_ENC_PATH):
         return False
+        
+    try:
+        import json
+        
+        # 1. 取得儲存在系統 Keyring 的專屬金鑰
+        key = _get_or_create_key()
+        f = Fernet(key)
+        
+        # 2. 讀取本地加密檔案並解密
+        with open(COOKIE_ENC_PATH, "rb") as file:
+            encrypted_data = file.read()
+            
+        json_str = f.decrypt(encrypted_data).decode('utf-8')
+        cookies = json.loads(json_str)
+        
+        ctx.add_cookies(cookies)
+        logger.info(f"Successfully decrypted and restored {len(cookies)} cookies.")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to decrypt cookies: {e}")
+    return False
+
+def _save_cookies(ctx):
+    """Encrypt session cookies using key from keyring and save to an encrypted local file."""
+    try:
+        import json
+        
+        cookies = ctx.cookies()
+        json_str = json.dumps(cookies)
+        
+        # 1. 取得（或建立）系統 Keyring 的專屬金鑰
+        key = _get_or_create_key()
+        f = Fernet(key)
+        
+        # 2. 將 Cookie 加密並寫入本地檔案
+        encrypted_data = f.encrypt(json_str.encode('utf-8'))
+        with open(COOKIE_ENC_PATH, "wb") as file:
+            file.write(encrypted_data)
+            
+        logger.info(f"Successfully encrypted and secured {len(cookies)} cookies locally.")
+    except Exception as e:
+        logger.error(f"Failed to save encrypted cookies: {e}")
 
 
 def _logged_in(page: Page) -> bool:
@@ -270,19 +297,25 @@ def generate(prompt: str, ref: str | None = None) -> tuple:
 
 
 # ── CLI ───────────────────────────────────────
+import os
 
 def cmd_login():
     """Interactive login helper — opens visible Chrome for manual login."""
     logger.info("Opening ChatGPT in visible browser. Log in manually, then press Enter.")
     
-    # ── 暫時繞過 cloakbrowser，改用標準 Playwright 啟動 ──
-    # 避免公司的 資安軟體 擋掉
+    user_data_dir = os.path.join(os.getcwd(), "playwright_user_data")
+    
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        # 強制開啟標準的 Chromium 視窗
-        browser = p.chromium.launch(headless=False)
-        ctx = browser.new_context(viewport={"width": 1280, "height": 900})
-        page = ctx.new_page()
+        # 💡 關鍵在於 channel="chrome"，強制調用你 Windows 系統裡的真實 Chrome
+        ctx = p.chromium.launch_persistent_context(
+            user_data_dir,
+            channel="chrome", 
+            headless=False,
+            viewport={"width": 1280, "height": 900},
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(CHATGPT_URL, wait_until="domcontentloaded")
         
         input("Press Enter after login...")
@@ -292,7 +325,7 @@ def cmd_login():
             logger.info("Login successful! Cookies saved.")
         else:
             logger.error("Login not detected. Try again.")
-        browser.close()
+        ctx.close()
 
 
 def main():

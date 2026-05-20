@@ -1,7 +1,11 @@
-temp/
-cookies.json
-__pycache__/
-*.pyc
-.DS_Store
+# 補強各種大小寫與散落的虛擬環境目錄
 .venv/
 venv/
+ENV/
+env/
+/Include/
+/Lib/
+/Scripts/
+pyvenv.cfg
+# 排除 Playwright 產生的 Chrome 瀏覽器快取數據夾
+playwright_user_data/
